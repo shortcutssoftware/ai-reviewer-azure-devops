@@ -1,0 +1,175 @@
+trigger: none
+
+pr:
+  branches:
+    include:
+    - main
+  autoCancel: false
+
+pool: 'ols-analysis'
+
+variables:
+  - group: 'Common Variables'
+  - name: 'Model'
+    value: 'claude-3-7-sonnet-20250219'
+  - name: 'ModelVersion'
+    value: '2023-06-01'
+  - name: 'Organization'
+    value: '<your_organization>'
+  - name: 'Project'
+    value: '<your_project>'
+  - name: 'ProjectID'
+    value: '<your_project_id>'
+
+steps:
+  - task: PowerShell@2
+    displayName: Login into azure devops powershell
+    inputs:
+      targetType: 'inline'
+      script: |
+        az devops logout
+        $repo = Split-Path -Leaf $(System.PullRequest.SourceRepositoryURI)
+        echo $repo
+
+        az config set extension.use_dynamic_install=yes_without_prompt
+        echo $(System.AccessToken) | az devops login
+
+        $repositoryId = $(az repos list --organization "$(Organization)" --project "$(Project)" --query "[?name == '$repo'].id" --output tsv)
+        echo $repositoryId
+
+        Write-Host "##vso[task.setvariable variable=repositoryId]$repositoryId"
+        Write-Host "##vso[task.setvariable variable=repo]$repo"
+
+  - task: Bash@3
+    displayName: 'Clone repo'
+    inputs:
+      targetType: 'inline'
+      script: |
+        echo $(repo)
+
+        rm -rf $(repo)
+        echo "removed repo if existed"
+
+        git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" clone $(System.PullRequest.SourceRepositoryURI)
+        
+        echo "successfully pulled new repo"
+        
+        cd $(repo)
+        echo "Successfully cloned repository"
+      workingDirectory: '$(Pipeline.Workspace)'
+
+  - task: Bash@3
+    displayName: 'build PR diff'
+    inputs:
+      targetType: 'inline'
+      script: |
+        SOURCE_BRANCH=$(echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads|remotes/origin|')
+        TARGET_BRANCH=$(echo $(System.PullRequest.TargetBranch) | sed 's|refs/heads|remotes/origin|')
+        
+        cd $(repo)
+
+        git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" fetch --all
+        git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff $(echo $TARGET_BRANCH) $(echo $SOURCE_BRANCH) -U100 > diff.patch
+
+      workingDirectory: '$(Pipeline.Workspace)'
+
+  - task: Bash@3
+    displayName: 'claude-3-7-sonnet-20250219 SCA'
+    inputs:
+      targetType: 'inline'
+      script: |
+        cd $(repo) || { echo "Error: Failed to enter repository directory"; exit 1; }
+
+        SOURCE_BRANCH=$(echo $(System.PullRequest.SourceBranch) | sed 's|refs/heads|remotes/origin|')
+        TARGET_BRANCH=$(echo $(System.PullRequest.TargetBranch) | sed 's|refs/heads|remotes/origin|')
+
+        files=$(git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff $(echo $TARGET_BRANCH) $(echo $SOURCE_BRANCH) --name-only)
+        echo $files
+
+        for FILE in $files; do
+              if [[ "$FILE" == *.cs || "$FILE" == *.java || "$FILE" == *.ts ]]; then
+                echo "Analyzing $FILE"
+                CONTENT=$(cat "$FILE")
+                echo "$(git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff -U500 $(echo $TARGET_BRANCH):$FILE $(echo $SOURCE_BRANCH):$FILE)" >> diff.patch
+              fi
+        done
+
+        # cat diff.patch
+
+        if [ -s diff.patch ] && grep -q . diff.patch; then
+            jq -Rs --arg model "$(Model)" '
+            {
+              model: $model,
+              max_tokens: 6000,
+              messages: [
+                    {
+                    role: "user", 
+                    content: "Review this git diff. Provide suggestions to improve the code; check for quality, bugs, typos and best practices \n\(.)"
+                    }
+                ]
+            }' diff.patch > payload_diff.json
+
+            cat payload_diff.json
+
+            echo "**Suggestions:**" >> response.txt 
+            curl -X POST https://api.anthropic.com/v1/messages \
+                -H "x-api-key: $(ANTHROPIC_API_KEY)" \
+                -H "anthropic-version: $(ModelVersion)" \
+                -H "content-type: application/json" \
+                --data "@payload_diff.json" | jq -r '.content[0].text' >> response.txt
+
+            cat response.txt
+        else
+            echo "diff.patch does not have any .cs, .ts or .java file types"
+        fi
+
+      workingDirectory: '$(Pipeline.Workspace)'
+
+  - task: Bash@3
+    displayName: 'Create a PR Commment'
+    inputs:
+      targetType: 'inline'
+      script: |
+
+        cd $(repo) || { echo "Error: Failed to enter repository directory"; exit 1; }
+
+        uri="$(Organization)/$(ProjectID)/_apis/git/repositories/$(repositoryId)/pullRequests/$(System.PullRequest.PullRequestId)/threads"
+        content=$(cat response.txt)
+
+        body=$(jq -n \
+          --arg content "$(cat response.txt)" \
+          --arg timestamp "$(date -u +"%Y-%m-%dT%H:%M:%S.%3NZ")" \
+          '{
+            "id": -1,
+            "comments": [
+              {
+                "commentType": 1,
+                "content": $content
+              }
+            ],
+            "properties": {
+              "Microsoft.TeamFoundation.Discussion.SupportsMarkdown": {
+                "type": "System.Int32",
+                "value": 1
+              }
+            },
+            "lastUpdatedDate": $timestamp,
+            "publishedDate": $timestamp,
+            "status": 1
+          }')
+
+        curl -s -X POST "$uri" \
+          -H "Authorization: Bearer $(System.AccessToken)" \
+          -H "Accept: application/json;api-version=5.0-preview" \
+          -H "Content-Type: application/json" \
+          -d "$body" \
+          --verbose
+      workingDirectory: '$(Pipeline.Workspace)'
+
+  - task: Bash@3
+    displayName: 'Cleanup'
+    inputs:
+      targetType: 'inline'
+      script: |
+        rm -rf $(repo)
+      workingDirectory: '$(Pipeline.Workspace)'
