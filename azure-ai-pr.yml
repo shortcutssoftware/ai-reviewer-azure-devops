@@ -86,41 +86,159 @@ steps:
         files=$(git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff $(echo $TARGET_BRANCH) $(echo $SOURCE_BRANCH) --name-only)
         echo $files
 
+        # Create individual diff files for each changed file
+        file_count=0
         for FILE in $files; do
               if [[ "$FILE" == *.cs || "$FILE" == *.java || "$FILE" == *.ts ]]; then
                 echo "Analyzing $FILE"
-                CONTENT=$(cat "$FILE")
-                echo "$(git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff -U500 $(echo $TARGET_BRANCH):$FILE $(echo $SOURCE_BRANCH):$FILE)" >> diff.patch
+                git -c http.extraHeader="Authorization: Bearer $(System.AccessToken)" diff -U100 $(echo $TARGET_BRANCH):$FILE $(echo $SOURCE_BRANCH):$FILE > "diff_${file_count}.patch"
+                echo "$FILE" > "filename_${file_count}.txt"
+                file_count=$((file_count + 1))
               fi
         done
 
-        # cat diff.patch
+        if [ $file_count -eq 0 ]; then
+            echo "No .cs, .ts or .java file types found"
+            exit 0
+        fi
 
-        if [ -s diff.patch ] && grep -q . diff.patch; then
-            jq -Rs --arg model "$(Model)" '
+        echo "Found $file_count files to analyze"
+
+        # Function to call Anthropic API for a single diff chunk
+        call_anthropic_api() {
+            local chunk_file="$1"
+            local filename="$2"
+            local chunk_num="$3"
+            
+            if [ ! -s "$chunk_file" ]; then
+                echo "Skipping empty diff for $filename"
+                return
+            fi
+            
+            # Check if diff contains actual changes (not just whitespace)
+            if ! grep -q "^[+-]" "$chunk_file"; then
+                echo "No meaningful changes found in $filename"
+                return
+            fi
+            
+            jq -Rs --arg model "$(Model)" --arg filename "$filename" '
             {
               model: $model,
-              max_tokens: 6000,
+              max_tokens: 4000,
               messages: [
                     {
                     role: "user", 
-                    content: "Review this git diff. Provide suggestions to improve the code; check for quality, bugs, typos and best practices \n\(.)"
+                    content: "Review this git diff for file \($filename). Focus on critical issues, security vulnerabilities, bugs, and performance problems. Provide specific, actionable feedback prioritized by severity. Format your response with severity levels (CRITICAL, HIGH, MEDIUM, LOW) and be concise:\n\(.)"
                     }
                 ]
-            }' diff.patch > payload_diff.json
+            }' "$chunk_file" > "payload_${chunk_num}.json"
 
-            cat payload_diff.json
-
-            echo "**Suggestions:**" >> response.txt 
-            curl -X POST https://api.anthropic.com/v1/messages \
+            # Make API call with error handling
+            http_status=$(curl -s -w "%{http_code}" -X POST https://api.anthropic.com/v1/messages \
                 -H "x-api-key: $(ANTHROPIC_API_KEY)" \
                 -H "anthropic-version: $(ModelVersion)" \
                 -H "content-type: application/json" \
-                --data "@payload_diff.json" | jq -r '.content[0].text' >> response.txt
+                --data "@payload_${chunk_num}.json" -o "api_response_${chunk_num}.json")
+            
+            if [ "$http_status" -eq 200 ]; then
+                jq -r '.content[0].text' "api_response_${chunk_num}.json" > "response_${chunk_num}.txt" 2>/dev/null
+                if [ $? -eq 0 ] && [ -s "response_${chunk_num}.txt" ]; then
+                    echo "## File: $filename" >> "detailed_response_${chunk_num}.txt"
+                    cat "response_${chunk_num}.txt" >> "detailed_response_${chunk_num}.txt"
+                    echo "" >> "detailed_response_${chunk_num}.txt"
+                    echo "Successfully analyzed $filename"
+                else
+                    echo "Warning: Failed to parse API response for $filename"
+                fi
+            else
+                echo "Warning: API request failed for $filename (HTTP $http_status)"
+                # Create fallback response
+                echo "## File: $filename" >> "detailed_response_${chunk_num}.txt"
+                echo "⚠️  Analysis unavailable for this file due to API error" >> "detailed_response_${chunk_num}.txt"
+                echo "" >> "detailed_response_${chunk_num}.txt"
+            fi
+        }
 
+        # Process each file separately to avoid token limits
+        for i in $(seq 0 $((file_count - 1))); do
+            if [ -f "diff_${i}.patch" ] && [ -f "filename_${i}.txt" ]; then
+                filename=$(cat "filename_${i}.txt")
+                echo "Processing chunk $i for file: $filename"
+                call_anthropic_api "diff_${i}.patch" "$filename" "$i"
+            fi
+        done
+
+        # Generate summary of all findings
+        echo "Generating prioritized summary..."
+        
+        # Collect all individual responses for summary generation
+        cat detailed_response_*.txt > all_responses.txt 2>/dev/null || echo "" > all_responses.txt
+        
+        if [ -s all_responses.txt ]; then
+            # Count successful analyses
+            analysis_count=$(ls detailed_response_*.txt 2>/dev/null | wc -l)
+            echo "Successfully analyzed $analysis_count file(s)"
+            
+            # Create summary prompt
+            jq -Rs --arg model "$(Model)" '
+            {
+              model: $model,
+              max_tokens: 2000,
+              messages: [
+                    {
+                    role: "user", 
+                    content: "Based on the following code review findings from multiple files, create a prioritized executive summary. List the top 5-7 most critical issues that need immediate attention, ordered by severity and impact. Each item should be concise (1-2 lines) and actionable. Use this format:\n\n## 🎯 Priority Issues Summary\n\n### Critical Issues\n- [Issue description with file reference]\n\n### High Priority\n- [Issue description with file reference]\n\n### Medium Priority\n- [Issue description with file reference]\n\nIf no critical issues are found, focus on the most important improvements. Input findings:\n\(.)"
+                    }
+                ]
+            }' all_responses.txt > payload_summary.json
+
+            # Generate summary with error handling
+            summary_http_status=$(curl -s -w "%{http_code}" -X POST https://api.anthropic.com/v1/messages \
+                -H "x-api-key: $(ANTHROPIC_API_KEY)" \
+                -H "anthropic-version: $(ModelVersion)" \
+                -H "content-type: application/json" \
+                --data "@payload_summary.json" -o "api_summary_response.json")
+
+            # Build final response with summary first, then detailed findings
+            echo "# 📋 AI Code Review Results" > response.txt
+            echo "" >> response.txt
+            
+            if [ "$summary_http_status" -eq 200 ]; then
+                jq -r '.content[0].text' "api_summary_response.json" > summary_response.txt 2>/dev/null
+                if [ $? -eq 0 ] && [ -s summary_response.txt ]; then
+                    cat summary_response.txt >> response.txt
+                    echo "" >> response.txt
+                    echo "---" >> response.txt
+                    echo "" >> response.txt
+                    echo "Summary generation completed successfully"
+                else
+                    echo "## 🎯 Priority Issues Summary" >> response.txt
+                    echo "" >> response.txt
+                    echo "⚠️  Unable to generate priority summary due to parsing error" >> response.txt
+                    echo "" >> response.txt
+                    echo "---" >> response.txt
+                    echo "" >> response.txt
+                fi
+            else
+                echo "## 🎯 Priority Issues Summary" >> response.txt
+                echo "" >> response.txt
+                echo "⚠️  Unable to generate priority summary due to API error (HTTP $summary_http_status)" >> response.txt
+                echo "" >> response.txt
+                echo "---" >> response.txt
+                echo "" >> response.txt
+            fi
+            
+            echo "## 📄 Detailed File-by-File Analysis" >> response.txt
+            echo "" >> response.txt
+            cat all_responses.txt >> response.txt
+
+            echo "Final response prepared with $(wc -l < response.txt) lines"
             cat response.txt
         else
-            echo "diff.patch does not have any .cs, .ts or .java file types"
+            echo "No analysis results generated"
+            echo "# 📋 AI Code Review Results" > response.txt
+            echo "" >> response.txt
+            echo "⚠️  No reviewable changes found in supported file types (.cs, .java, .ts)" >> response.txt
         fi
 
       workingDirectory: '$(Pipeline.Workspace)'
