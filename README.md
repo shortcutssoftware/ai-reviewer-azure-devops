@@ -16,3 +16,18 @@ It leverages Anthropic's 3.7 sonnet model AI to analyse code changes, identify p
 - Support for additional programming languages and larger files.
 - Improved AI model integration and retry.
 - Error handling and logging.
+
+## Recent Improvements
+
+### Intelligent Review Processing for Large PRs
+The pipeline now includes enhanced processing for large pull requests:
+
+- **File-by-file Analysis**: Instead of sending entire diffs in one request, each file is analyzed separately to avoid token limits
+- **Prioritized Summary**: AI generates an executive summary highlighting the most critical issues first
+- **Structured Output**: Reviews now include:
+  - 🎯 **Priority Issues Summary** - Top 5-7 critical items ordered by severity 
+  - 📄 **Detailed File-by-File Analysis** - Complete findings organized by file
+- **Error Handling**: Robust handling of API failures with fallback responses
+- **Smart Filtering**: Only analyzes meaningful code changes, ignoring whitespace-only modifications
+
+This improvement addresses the chunking issues that previously resulted in fragmented, unprioritized review output for large pull requests.
