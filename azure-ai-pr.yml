@@ -11,7 +11,7 @@ pool: 'ols-analysis'
 variables:
   - group: 'Common Variables'
   - name: 'Model'
-    value: 'claude-3-7-sonnet-20250219'
+    value: 'claude-sonnet-4-5-20250929'
   - name: 'ModelVersion'
     value: '2023-06-01'
   - name: 'Organization'
@@ -74,7 +74,7 @@ steps:
       workingDirectory: '$(Pipeline.Workspace)'
 
   - task: Bash@3
-    displayName: 'claude-3-7-sonnet-20250219 SCA'
+    displayName: 'Claude Sonnet 4.5'
     inputs:
       targetType: 'inline'
       script: |
